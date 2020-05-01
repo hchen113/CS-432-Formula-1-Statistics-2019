@@ -1,0 +1,488 @@
+# When a task that used to pass starts to fail
+# Go through all versions that may have been skipped to detect
+# when the task started failing
+stepback: true
+
+# Mark a failure as a system/bootstrap failure (purple box) rather then a task
+# failure by default.
+# Actual testing tasks are marked with `type: test`
+command_type: system
+
+# Protect ourself against rogue test case, or curl gone wild, that runs forever
+# Good rule of thumb: the averageish length a task takes, times 5
+# That roughly accounts for variable system performance for various buildvariants
+exec_timeout_secs: 1800 # 30 minutes is the longest we'll ever run
+
+# What to do when evergreen hits the timeout (`post:` tasks are run automatically)
+timeout:
+  - command: shell.exec
+    params:
+      script: |
+        ls -la
+
+functions:
+  "fetch source":
+    # Executes git clone and applies the submitted patch, if any
+    - command: git.get_project
+      params:
+        directory: "src"
+    # Applies the submitted patch, if any
+    # Deprecated. Should be removed. But still needed for certain agents (ZAP)
+    - command: git.apply_patch
+    # Make an evergreen exapanstion file with dynamic values
+    - command: shell.exec
+      params:
+        working_dir: "src"
+        script: |
+           # Get the current unique version of this checkout
+           if [ "${is_patch}" = "true" ]; then
+              CURRENT_VERSION=$(git describe)-patch-${version_id}
+           else
+              CURRENT_VERSION=latest
+           fi
+
+           export DRIVERS_TOOLS="$(dirname $(pwd))/drivers-tools"
+           export PROJECT_DIRECTORY="$(pwd)"
+
+           # Python has cygwin path problems on Windows. Detect prospective mongo-orchestration home directory
+           if [ "Windows_NT" = "$OS" ]; then # Magic variable in cygwin
+              export DRIVERS_TOOLS=$(cygpath -m $DRIVERS_TOOLS)
+              export PROJECT_DIRECTORY=$(cygpath -m $PROJECT_DIRECTORY)
+           fi
+
+           export MONGO_ORCHESTRATION_HOME="$DRIVERS_TOOLS/.evergreen/orchestration"
+           export MONGODB_BINARIES="$DRIVERS_TOOLS/mongodb/bin"
+           export UPLOAD_BUCKET="${project}"
+
+           cat <<EOT > expansion.yml
+           CURRENT_VERSION: "$CURRENT_VERSION"
+           DRIVERS_TOOLS: "$DRIVERS_TOOLS"
+           MONGO_ORCHESTRATION_HOME: "$MONGO_ORCHESTRATION_HOME"
+           MONGODB_BINARIES: "$MONGODB_BINARIES"
+           UPLOAD_BUCKET: "$UPLOAD_BUCKET"
+           PROJECT_DIRECTORY: "$PROJECT_DIRECTORY"
+           PREPARE_SHELL: |
+              set -o errexit
+              set -o xtrace
+              export DRIVERS_TOOLS="$DRIVERS_TOOLS"
+              export MONGO_ORCHESTRATION_HOME="$MONGO_ORCHESTRATION_HOME"
+              export MONGODB_BINARIES="$MONGODB_BINARIES"
+              export UPLOAD_BUCKET="$UPLOAD_BUCKET"
+              export PROJECT_DIRECTORY="$PROJECT_DIRECTORY"
+
+              export TMPDIR="$MONGO_ORCHESTRATION_HOME/db"
+              export PATH="$MONGODB_BINARIES:$PATH"
+              export PROJECT="${project}"
+           EOT
+           # See what we've done
+           cat expansion.yml
+
+    # Load the expansion file to make an evergreen variable with the current unique version
+    - command: expansions.update
+      params:
+        file: src/expansion.yml
+
+  "prepare resources":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          rm -rf $DRIVERS_TOOLS
+          if [ "${project}" = "drivers-tools" ]; then
+            # If this was a patch build, doing a fresh clone would not actually test the patch
+            cp -R ${PROJECT_DIRECTORY}/ $DRIVERS_TOOLS
+          else
+            git clone git://github.com/mongodb-labs/drivers-evergreen-tools.git $DRIVERS_TOOLS
+          fi
+          echo "{ \"releases\": { \"default\": \"$MONGODB_BINARIES\" }}" > $MONGO_ORCHESTRATION_HOME/orchestration.config
+
+  "bootstrap mongo-orchestration":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          MONGODB_VERSION=${MONGODB_VERSION} \
+            TOPOLOGY=${TOPOLOGY} \
+            SSL=${SSL} \
+            AUTH=${AUTH} \
+            sh ${DRIVERS_TOOLS}/.evergreen/run-orchestration.sh
+    # run-orchestration generates expansion file with the MONGODB_URI for the cluster
+    - command: expansions.update
+      params:
+        file: mo-expansion.yml
+    - command: expansions.update
+      params:
+        updates:
+          - key: MONGODB_STARTED
+            value: "1"
+
+  "stop mongo-orchestration":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          sh ${DRIVERS_TOOLS}/.evergreen/stop-orchestration.sh
+  "upload-mo-artifacts":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          find $MONGO_ORCHESTRATION_HOME -name \*.log | xargs tar czf mongodb-logs.tar.gz
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: mongodb-logs.tar.gz
+        remote_file: ${UPLOAD_BUCKET}/${build_variant}/${revision}/${version_id}/${build_id}/logs/${task_id}-${execution}-mongodb-logs.tar.gz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: "mongodb-logs.tar.gz"
+
+  "run tests":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+
+          MONGODB_URI="${MONGODB_URI}" \
+          TOPOLOGY=${TOPOLOGY} \
+          SSL=${SSL} \
+          AUTH=${AUTH} \
+          SWIFT_VERSION=${SWIFT_VERSION} \
+            sh ${PROJECT_DIRECTORY}/.evergreen/run-tests.sh
+
+  "run atlas tests":
+    - command: shell.exec
+      type: test
+      params:
+        silent: true
+        working_dir: "src"
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          SWIFT_VERSION=${SWIFT_VERSION} ATLAS_REPL='${ATLAS_REPL}' ATLAS_SHRD='${ATLAS_SHRD}' ATLAS_FREE='${ATLAS_FREE}' ATLAS_TLS11='${ATLAS_TLS11}' ATLAS_TLS12='${ATLAS_TLS12}' \
+          ATLAS_REPL_SRV='${ATLAS_REPL_SRV}' ATLAS_SHRD_SRV='${ATLAS_SHRD_SRV}' ATLAS_FREE_SRV='${ATLAS_FREE_SRV}' ATLAS_TLS11_SRV='${ATLAS_TLS11_SRV}' ATLAS_TLS12_SRV='${ATLAS_TLS12_SRV}' \
+          sh ${PROJECT_DIRECTORY}/.evergreen/run-atlas-tests.sh
+
+  "cleanup":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          rm -rf $DRIVERS_TOOLS || true
+
+  "fix absolute paths":
+    - command: shell.exec
+      params:
+        script: |
+          ${PREPARE_SHELL}
+          for filename in $(find ${DRIVERS_TOOLS} -name \*.json); do
+            perl -p -i -e "s|ABSOLUTE_PATH_REPLACEMENT_TOKEN|${DRIVERS_TOOLS}|g" $filename
+          done
+
+  "install dependencies":
+    - command: shell.exec
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+
+          SWIFT_VERSION=${SWIFT_VERSION} \
+            sh ${PROJECT_DIRECTORY}/.evergreen/install-dependencies.sh
+
+pre:
+  - func: "fetch source"
+  - func: "install dependencies"
+
+post:
+  - func: "stop mongo-orchestration"
+  - func: "upload-mo-artifacts"
+  - func: "cleanup"
+
+tasks:
+    - name: "test-3.6-standalone"
+      tags: ["3.6", "standalone"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "3.6"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-3.6-replica_set"
+      tags: ["3.6", "replica_set"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "3.6"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-3.6-sharded_cluster"
+      tags: ["3.6", "sharded_cluster"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "3.6"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-4.0-standalone"
+      tags: ["4.0", "standalone"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.0"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-4.0-replica_set"
+      tags: ["4.0", "replica_set"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.0"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-4.0-sharded_cluster"
+      tags: ["4.0", "sharded_cluster"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.0"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-4.2-standalone"
+      tags: ["4.2", "standalone"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.2"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-4.2-replica_set"
+      tags: ["4.2", "replica_set"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.2"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-4.2-sharded_cluster"
+      tags: ["4.2", "sharded_cluster"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.2"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-4.4-standalone"
+      tags: ["4.4", "standalone"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.4"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-4.4-replica_set"
+      tags: ["4.4", "replica_set"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.4"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-4.4-sharded_cluster"
+      tags: ["4.4", "sharded_cluster"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "4.4"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-latest-standalone"
+      tags: ["latest", "standalone"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "latest"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-latest-replica_set"
+      tags: ["latest", "replica_set"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "latest"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-latest-sharded_cluster"
+      tags: ["latest", "sharded_cluster"]
+      commands:
+        - func: "prepare resources"
+        - func: "fix absolute paths"
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            MONGODB_VERSION: "latest"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
+
+    - name: "test-atlas-connectivity"
+      tags: ["atlas-connect"]
+      commands:
+        - func: "run atlas tests"
+
+axes:
+  - id: versions
+    display_name: MongoDB Version
+    values:
+      - id: "latest"
+        display_name: "latest"
+        variables:
+           MONGODB_VERSION: "latest"
+      - id: "4.4"
+        display_name: "4.4"
+        variables:
+          MONGODB_VERSION: "4.4"      
+      - id: "4.2"
+        display_name: "4.2"
+        variables:
+          MONGODB_VERSION: "4.2"
+      - id: "4.0"
+        display_name: "4.0"
+        variables:
+           MONGODB_VERSION: "4.0"
+      - id: "3.6"
+        display_name: "3.6"
+        variables:
+           MONGODB_VERSION: "3.6"
+
+  - id: os-fully-featured
+    display_name: OS
+    values:
+      - id: ubuntu-18.04
+        display_name: "Ubuntu 18.04"
+        run_on: ubuntu1804-test
+
+      - id: ubuntu-16.04
+        display_name: "Ubuntu 16.04"
+        run_on: ubuntu1604-test
+
+      - id: macos-1014
+        display_name: "macOS 10.14"
+        run_on: macos-1014
+
+  - id: topology
+    display_name: Topology
+    values:
+      - id: standalone
+        display_name: Standalone
+        variables:
+           TOPOLOGY: "server"
+      - id: replicaset
+        display_name: Replica Set
+        variables:
+           TOPOLOGY: "replica_set"
+      - id: sharded-cluster
+        display_name: Sharded Cluster
+        variables:
+           TOPOLOGY: "sharded_cluster"
+  - id: swift-version
+    display_name: "Swift"
+    values:
+      - id: "5.1"
+        display_name: "Swift 5.1"
+        variables:
+           SWIFT_VERSION: "5.1.4"
+      - id: "5.2"
+        display_name: "Swift 5.2"
+        variables:
+           SWIFT_VERSION: "5.2"
+
+  - id: ssl-auth
+    display_name: SSL and Auth
+    values:
+      - id: ssl-auth
+        display_name: SSL Auth
+        variables:
+          SSL: "ssl"
+          AUTH: "auth"
+      - id: nossl-noauth
+        display_name: NoSSL NoAuth
+        variables:
+          SSL: "nossl"
+          AUTH: "noauth"
+
+
+buildvariants:
+
+- matrix_name: "tests-all"
+  matrix_spec:
+    os-fully-featured: "*"
+    swift-version: "*"
+    ssl-auth: "*"
+  display_name: "${swift-version} ${os-fully-featured} ${ssl-auth}"
+  tasks:
+     - ".latest"
+     - ".4.4"
+     - ".4.2"
+     - ".4.0"
+     - ".3.6"
+  rules:
+  # pre 4.0 we are just using legacy linux mongoDB since ubuntu 18.04 didn't
+  # exist when 3.6 came out. legacy doesn't link to OpenSSL so we can't run
+  # SSL tests there.
+  - if:
+      os-fully-featured: "ubuntu-18.04"
+      swift-version: "*"
+      ssl-auth: "ssl-auth"
+    then:
+      remove_tasks: ".3.6"
+
+- matrix_name: "atlas-connect"
+  matrix_spec:
+    os-fully-featured: "*"
+    swift-version: "*"
+  display_name: "Atlas Connectivity ${swift-version} ${os-fully-featured}"
+  tasks:
+    - ".atlas-connect"

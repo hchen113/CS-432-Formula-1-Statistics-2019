@@ -1,0 +1,57 @@
+language: generic
+dist: xenial
+
+env:
+  global:
+    - MONGODB_VERSION=3.6.14
+
+jobs:
+  include:
+    - stage: pre-tests
+      name: verify Sourcery has been run
+      os: osx
+      install: ./etc/install_dependencies.sh sourcery
+      before_script: skip
+      script:
+        - make linuxmain SOURCERY=${PWD}/sourcery/bin/sourcery
+        - git diff --exit-code Tests/LinuxMain.swift
+        - make exports SOURCERY=${PWD}/sourcery/bin/sourcery
+        - git diff --exit-code Sources/MongoSwiftSync/Exports.swift
+
+    - stage: pre-tests
+      name: lint
+      os: osx
+      osx_image: xcode11.3
+      install: ./etc/install_dependencies.sh swiftlint && ./etc/install_dependencies.sh swiftformat
+      before_script: skip
+      script: ${PWD}/swiftlint/swiftlint --strict && ${PWD}/SwiftFormat/CommandLineTool/swiftformat --verbose --lint .
+
+    - stage: tests
+      os: osx
+      osx_image: xcode11.3
+      env: SWIFT_VERSION=5.2
+
+    - stage: tests
+      os: linux
+      env: SWIFT_VERSION=5.2
+
+    - stage: post-tests
+      name: code coverage
+      os: osx
+      osx_image: xcode11.3
+      script: make coverage
+      after_success: bash <(curl -s https://codecov.io/bash)
+
+install:
+  - INSTALLER=etc/install_dependencies.sh
+  - ./${INSTALLER} mongodb
+  - if [[ "$TRAVIS_JOB_NAME" != "code coverage" ]]; then eval "$(curl -sL https://swiftenv.fuller.li/install.sh)"; fi
+
+before_script:
+  - MONGODIR=${PWD}/mongodb-${MONGODB_VERSION}
+  - mkdir ${MONGODIR}/data
+  - ${MONGODIR}/bin/mongod --dbpath ${MONGODIR}/data --logpath ${MONGODIR}/mongodb.log --fork
+
+script:
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then make test-pretty; fi
+  - if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then make test; fi
